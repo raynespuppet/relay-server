@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: remote-control-relay
+    env: node
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
