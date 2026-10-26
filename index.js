@@ -9,7 +9,15 @@ const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+
+// Render free tier heartbeats:
+// - pingInterval: server pings every ~25s to keep connection alive and reset Render's 5-min timeout
+// - pingTimeout: treat client as dead after 30s of no pong
+const io = new Server(server, {
+  cors: { origin: '*' },
+  pingInterval: 25000,
+  pingTimeout: 30000
+});
 
 app.use(express.json());
 
@@ -116,9 +124,12 @@ io.on('connection', (socket) => {
       if (d.socketId === socket.id) {
         d.online = false;
         console.log(`[RELAY] ${code} disconnected`);
-        // Auto-remove after 60s
+        // Auto-remove after 60s if device didn't reconnect
         setTimeout(() => {
-          if (!d.online) devices.delete(code);
+          if (!d.online) {
+            console.log(`[RELAY] Cleaning up stale device: ${code}`);
+            devices.delete(code);
+          }
         }, 60000);
         break;
       }
