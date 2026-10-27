@@ -1,18 +1,15 @@
-// Relay Server - Device code pairing + WebRTC signaling relay
+// Relay Server - Device code pairing + command relay over WebSocket
 // Deploy to Render.com / Railway.app free tier
-// Client and dashboard connect here automatically (hardcoded URL)
+// No WebRTC: all commands travel over Socket.IO for reliability.
 
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
 
 // Render free tier heartbeats:
-// - pingInterval: server pings every ~25s to keep connection alive and reset Render's 5-min timeout
-// - pingTimeout: treat client as dead after 30s of no pong
 const io = new Server(server, {
   cors: { origin: '*' },
   pingInterval: 25000,
@@ -21,11 +18,8 @@ const io = new Server(server, {
 
 app.use(express.json());
 
-// Registered devices: code -> { id, type, socketId, hostname, online }
+// Devices: code -> { id, type, socketId, hostname, online }
 const devices = new Map();
-
-// Signaling rooms: roomId -> { senderSocketId, receiverSocketId }
-const signalingRooms = new Map();
 
 function generateDeviceCode(prefix) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -40,7 +34,6 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', devices: devices.size });
 });
 
-// Look up a device by code (for controller to find target)
 app.get('/api/device/:code', (req, res) => {
   const device = devices.get(req.params.code.toUpperCase());
   if (!device) {
@@ -49,7 +42,6 @@ app.get('/api/device/:code', (req, res) => {
   res.json({ code: device.code, online: device.online, hostname: device.hostname, type: device.type });
 });
 
-// List all online client devices (for dashboard to auto-discover)
 app.get('/api/online-clients', (req, res) => {
   const clients = [];
   for (const [code, d] of devices.entries()) {
@@ -63,7 +55,6 @@ app.get('/api/online-clients', (req, res) => {
 io.on('connection', (socket) => {
   let device = null;
 
-  // Client or controller registers with this relay
   socket.on('register', ({ type, hostname }) => {
     const code = generateDeviceCode(type === 'controller' ? 'GL' : undefined);
     device = {
@@ -82,49 +73,58 @@ io.on('connection', (socket) => {
   // Controller looks up a client device by code
   socket.on('lookup', ({ code }) => {
     const target = devices.get(code.toUpperCase());
-    if (!target) {
-      socket.emit('lookup-result', { code, found: false, error: 'Device not found or offline' });
-    } else if (!target.online) {
-      socket.emit('lookup-result', { code, found: false, error: 'Device offline' });
+    if (!target || !target.online) {
+      socket.emit('lookup-result', { code, found: !target, error: target ? 'Device offline' : 'Device not found' });
     } else {
-      socket.emit('lookup-result', { code, found: true, hostname: target.hostname, targetSocketId: target.socketId });
+      socket.emit('lookup-result', { code, found: true, hostname: target.hostname, targetCode: target.code });
     }
   });
 
-  // Start WebRTC signaling between two devices
-  socket.on('start-signaling', ({ roomId, targetSocketId }) => {
-    signalingRooms.set(roomId, {
-      senderSocketId: socket.id,
-      receiverSocketId: targetSocketId
-    });
-    console.log(`[RELAY] Signaling room ${roomId}: ${socket.id} -> ${targetSocketId}`);
-
-    // Notify both peers
-    io.to(socket.id).emit('signaling-started', { roomId, yourRole: 'sender' });
-    io.to(targetSocketId).emit('signaling-started', { roomId, yourRole: 'receiver' });
-  });
-
-  // Forward WebRTC messages (offer, answer, ICE)
-  socket.on('signal', ({ roomId, message, toSocketId }) => {
-    if (!toSocketId) {
-      const room = signalingRooms.get(roomId);
-      if (room) {
-        const target = room.senderSocketId === socket.id ? room.receiverSocketId : room.senderSocketId;
-        io.to(target).emit('signal', { roomId, message, fromSocketId: socket.id });
-      }
+  // Controller connects to target: relay just acknowledges and sets a mapping
+  socket.on('connect-to-target', ({ targetCode }) => {
+    const target = devices.get(targetCode.toUpperCase());
+    if (!target || !target.online) {
+      socket.emit('connect-result', { targetCode, ok: false, error: target ? 'Offline' : 'Not found' });
     } else {
-      io.to(toSocketId).emit('signal', { roomId, message, fromSocketId: socket.id });
+      console.log(`[RELAY] Controller ${socket.id} connected to target ${targetCode}`);
+      socket.emit('connect-result', { targetCode, ok: true, hostname: target.hostname });
+      // Notify target that controller is ready
+      socket.to(target.socketId).emit('controller-connected', { controllerCode: device?.code || 'unknown' });
     }
   });
 
-  // Cleanup on disconnect
+  // Controller sends a command to target client via code
+  socket.on('command', ({ targetCode, action, payload }) => {
+    const target = devices.get(targetCode.toUpperCase());
+    if (!target || !target.online) {
+      socket.emit('command-status', { action, status: 'error', message: 'Target offline or not found' });
+      return;
+    }
+    console.log(`[RELAY] Command ${action} to ${targetCode}`);
+    socket.to(target.socketId).emit('command', { action, payload });
+  });
+
+  // Client replies with result of command
+  socket.on('command-result', ({ action, success, message, data, output }) => {
+    // Forward results back to all connected controllers (safe: only your dashboard connects as controller)
+    if (device && device.type === 'client') {
+      io.emit('command-result-from-client', {
+        fromCode: device.code,
+        fromHostname: device.hostname,
+        action,
+        success,
+        message,
+        data,
+        output
+      });
+    }
+  });
+
   socket.on('disconnect', () => {
-    // Remove device
     for (const [code, d] of devices.entries()) {
       if (d.socketId === socket.id) {
         d.online = false;
         console.log(`[RELAY] ${code} disconnected`);
-        // Auto-remove after 60s if device didn't reconnect
         setTimeout(() => {
           if (!d.online) {
             console.log(`[RELAY] Cleaning up stale device: ${code}`);
@@ -132,13 +132,6 @@ io.on('connection', (socket) => {
           }
         }, 60000);
         break;
-      }
-    }
-
-    // Clean signaling rooms
-    for (const [roomId, room] of signalingRooms.entries()) {
-      if (room.senderSocketId === socket.id || room.receiverSocketId === socket.id) {
-        signalingRooms.delete(roomId);
       }
     }
   });
