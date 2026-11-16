@@ -186,14 +186,14 @@ io.on('connection', (socket) => {
   });
 
   // Controller sends a command to target client via code
-  socket.on('command', ({ targetCode, action, payload }) => {
+  socket.on('command', ({ targetCode, action, payload, fromController }) => {
     const target = devices.get(targetCode.toUpperCase());
     if (!target || !target.online) {
       socket.emit('command-status', { action, status: 'error', message: 'Target offline or not found' });
       return;
     }
-    console.log(`[RELAY] Command ${action} to ${targetCode}`);
-    socket.to(target.socketId).emit('command', { action, payload });
+    console.log(`[RELAY] Command ${action} to ${targetCode}` + (fromController ? ` (from ${fromController})` : ''));
+    socket.to(target.socketId).emit('command', { action, payload, fromController });
   });
 
   // Client replies with result of command
