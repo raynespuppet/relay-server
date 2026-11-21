@@ -108,7 +108,7 @@ app.get('/api/online-clients', (req, res) => {
 io.on('connection', (socket) => {
   let device = null;
 
-  socket.on('register', ({ type, hostname, stableId, userLabel }) => {
+  socket.on('register', ({ type, hostname, stableId, userLabel, controllerName }) => {
     const code = generateDeviceCode(type === 'controller' ? 'GL' : undefined);
     device = {
       code,
@@ -119,7 +119,8 @@ io.on('connection', (socket) => {
       online: true,
       stableId: stableId || null,
       userLabel: userLabel || null,
-      customName: null
+      customName: null,
+      controllerName: controllerName || null
     };
 
     // For clients, check if this stableId was seen before (reconnect)
@@ -140,6 +141,7 @@ io.on('connection', (socket) => {
     if (stableId) logParts.push(`stableId=${stableId}`);
     if (userLabel) logParts.push(`userLabel=${userLabel}`);
     if (displayName) logParts.push(`customName=${displayName}`);
+    if (type === 'controller') logParts.push(`controllerName=${device.controllerName}`);
     console.log(logParts.join(' '));
 
     socket.emit('registered', {
@@ -150,6 +152,12 @@ io.on('connection', (socket) => {
       customName: displayName || null,
       displayName: displayName || userLabel || hostname
     });
+
+    // Notify all clients of new controller registration
+    if (type === 'controller') {
+      const ctrlName = device.controllerName || device.hostname || code;
+      io.emit('controller-online', { controllerName: ctrlName, code: device.code });
+    }
   });
 
   // Controller looks up a client device by code
@@ -216,10 +224,20 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    const disconnectingType = device?.type;
+    const disconnectingControllerName = device?.controllerName || device?.hostname;
+
     for (const [code, d] of devices.entries()) {
       if (d.socketId === socket.id) {
         d.online = false;
         console.log(`[RELAY] ${code} disconnected`);
+
+        // Notify all clients if a controller went offline
+        if (disconnectingType === 'controller') {
+          const ctrlName = disconnectingControllerName || code;
+          io.emit('controller-offline', { controllerName: ctrlName, code });
+        }
+
         setTimeout(() => {
           if (!d.online) {
             console.log(`[RELAY] Cleaning up stale device: ${code}`);
